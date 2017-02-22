@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -80,23 +81,130 @@ static char const *fmt_time_delta(char *buf,
 	return fmt_ns(buf, timespec_to_ns(end) - timespec_to_ns(start));
 }
 
+static void simple_memcpy(void *dst_, void const *src_, size_t len)
+{
+	for (;; ) {
+		typedef uintmax_t	mem_t;
+
+		mem_t		*dst = dst_;
+		mem_t const	*src = src_;
+
+		if ((uintptr_t)dst % sizeof *dst != 0 ||
+		    (uintptr_t)src % sizeof *src != 0)
+			break;
+
+		while (len >= sizeof *dst) {
+			*dst++ = *src++;
+			len   -= sizeof *dst;
+		}
+
+		dst_ = dst;
+		src_ = src;
+
+		break;
+	}
+
+	for (;; ) {
+		typedef uint8_t	mem_t;
+
+		mem_t		*dst = dst_;
+		mem_t const	*src = src_;
+
+		if ((uintptr_t)dst % sizeof *dst != 0 ||
+		    (uintptr_t)src % sizeof *src != 0)
+			break;
+
+		while (len >= sizeof *dst) {
+			*dst++ = *src++;
+			len   -= sizeof *dst;
+		}
+
+		dst_ = dst;
+		src_ = src;
+
+		break;
+	}
+}
+
 static void speed_test(struct buf const *buf, void *tmp_buf, size_t cnt)
 {
+	static char const * const	MODE_STR[] = {
+		[0] = "simple_memcpy()",
+		[1] = "memcpy()",
+		[2] = "ldm+stm",
+		[3] = "ldm"
+	};
+	static bool			mode_shown = false;
 	struct timespec	tm_a;
 	struct timespec	tm_b;
 	struct rusage	usage_a;
 	struct rusage	usage_b;
 	char		printf_buf[64];
 	size_t		orig_cnt = cnt;
+	int		cp_mode = 1;
 
+	if (getenv("MODE"))
+		cp_mode = atoi(getenv("MODE"));
+
+	if (!mode_shown) {
+		printf("==== %s =====\n", MODE_STR[cp_mode]);
+		mode_shown = true;
+	}
 
 	getrusage(RUSAGE_SELF, &usage_a);
 	clock_gettime(CLOCK_MONOTONIC, &tm_a);
 
+	__asm__("" ::: "memory");
+
 	while (cnt > 0) {
-		__asm__("" ::: "memory");
-		memcpy(tmp_buf, buf->mem, buf->len);
-		__asm__("" ::: "memory");
+		unsigned int	tmp_len = buf->len;
+		void const	*in_addr = buf->mem;
+		void 		*out_addr = tmp_buf;
+
+		switch (cp_mode) {
+		case 0:
+			simple_memcpy(out_addr, in_addr, tmp_len);
+			__asm__("" ::: "memory");
+			break;
+
+		case 1:
+			memcpy(out_addr, in_addr, tmp_len);
+			__asm__("" ::: "memory");
+			break;
+
+		case 2:
+			/* TODO: this is broken for buf->len < 32 and
+			 * unaligned addresses */
+			__asm__ __volatile__(
+				"1:\n"
+				"pld	[%[addr], #192]\n"
+				"ldm	%[addr]!,{r0-r7}\n"
+				"subs	%[cnt], #32\n"
+				"stm	%[out]!,{r0-r7}\n"
+				"bgt	1b\n"
+				: [cnt]  "+r" (tmp_len),
+				  [addr] "+r" (in_addr),
+				  [out]  "+r" (out_addr)
+				:
+				: "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7",
+				  "memory");
+			break;
+
+		case 3:
+			/* TODO: this is broken for buf->len < 32 and
+			 * unaligned addresses */
+			__asm__ __volatile__(
+				"1:\n"
+				"pld	[%[addr], #128]\n"
+				"ldm	%[addr]!,{r0-r7}\n"
+				"subs	%[cnt], #32\n"
+				"bgt	1b\n"
+				: [cnt]  "+r" (tmp_len),
+				  [addr] "+r" (in_addr)
+				:
+				: "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7",
+				  "memory");
+		}
 
 		--cnt;
 	}
